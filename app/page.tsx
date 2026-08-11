@@ -355,19 +355,27 @@ Content MUST feel 100% human-written, never AI-generated.
 `;
 
 const SakuraFalling = () => {
-  const [petals] = useState(() =>
-    Array.from({ length: 12 }).map((_, i) => ({
-      id: i,
-      left: `${Math.random() * 100}%`,
-      delay: Math.random() * 10,
-      duration: 15 + Math.random() * 25,
-      size: 8 + Math.random() * 12,
-      xOffset: `${(Math.random() - 0.5) * 15}vw`,
-    }))
-  );
+  const [mounted, setMounted] = useState(false);
+  const [petals, setPetals] = useState<Array<{ id: number; left: string; delay: number; duration: number; size: number; xOffset: string }>>([]);
+
+  useEffect(() => {
+    setPetals(
+      Array.from({ length: 12 }).map((_, i) => ({
+        id: i,
+        left: `${Math.random() * 100}%`,
+        delay: Math.random() * 10,
+        duration: 15 + Math.random() * 25,
+        size: 8 + Math.random() * 12,
+        xOffset: `${(Math.random() - 0.5) * 15}vw`,
+      }))
+    );
+    setMounted(true);
+  }, []);
+
+  if (!mounted) return null;
 
   return (
-    <div className="fixed inset-0 pointer-events-none overflow-hidden z-0 opacity-20 dark:opacity-10">
+    <div className="fixed inset-0 pointer-events-none overflow-hidden z-0 opacity-20 dark:opacity-10" suppressHydrationWarning>
       {petals.map((petal) => (
         <motion.div
           key={petal.id}
@@ -403,22 +411,14 @@ const SakuraFalling = () => {
 };
 
 export default function Dashboard() {
-  // Profile & Auth State
-  const [isCheckingKey, setIsCheckingKey] = useState(true);
-  const [hasKey, setHasKey] = useState(false);
+  // Single-User Mode & API Key State
   const [userApiKey, setUserApiKey] = useState('');
   const [apiKeyInput, setApiKeyInput] = useState('');
-  const [profiles, setProfiles] = useState<UserProfile[]>([]);
-  const [activeProfile, setActiveProfile] = useState<UserProfile | null>(null);
-  const [showProfileSelector, setShowProfileSelector] = useState(false);
-  const [newProfileName, setNewProfileName] = useState('');
-  const [newProfileEmoji, setNewProfileEmoji] = useState('😊');
-  const [isCreatingProfile, setIsCreatingProfile] = useState(false);
-  const [showNewProfileForm, setShowNewProfileForm] = useState(false);
-  const [isSavingApiKey, setIsSavingApiKey] = useState(false);
-  // currentApiKey: from active profile's cloud-synced key
-  // If empty, the server-side /api/generate route uses its own GEMINI_API_KEY env var
+  const [showApiKeyModal, setShowApiKeyModal] = useState(false);
+  const [hasKey, setHasKey] = useState(true);
+  const activeProfile: UserProfile = { id: 'default', name: 'Princess', emoji: '👑', gemini_api_key: null, created_at: '' };
   const currentApiKey = userApiKey || '';
+
 
   // Campaign Settings State
   const [productName, setProductName] = useState('');
@@ -443,7 +443,7 @@ export default function Dashboard() {
   const [carouselCount, setCarouselCount] = useState<number>(0);
   const [daysCount, setDaysCount] = useState<number>(10);
   const [includeModel, setIncludeModel] = useState(true);
-  const [selectedImageModel, setSelectedImageModel] = useState('gemini-3-pro-image-preview'); // Default to Nano Banana Pro as requested
+  const [selectedImageModel, setSelectedImageModel] = useState('gemini-2.5-flash-image'); // Default to Nano Banana Pro as requested
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [isLoadingSettings, setIsLoadingSettings] = useState(false);
 
@@ -578,28 +578,17 @@ export default function Dashboard() {
     );
   };
 
-  const withRetry = async <T,>(fn: () => Promise<T>, retries = 3, delay = 2000): Promise<T> => {
+  const withRetry = async <T,>(fn: () => Promise<T>, retries = 1, delay = 1000): Promise<T> => {
     try {
       return await fn();
     } catch (error: any) {
-      const errorStr = JSON.stringify(error).toLowerCase();
-      const isHighDemand = errorStr.includes('high demand') || 
-                          errorStr.includes('503') ||
-                          errorStr.includes('unavailable') ||
-                          errorStr.includes('429');
-
-      // For high demand, we can afford more retries with longer backoff
-      // If retries is explicitly set low (like 1), we respect it for fast fallback
-      const effectiveRetries = (isHighDemand && retries > 1) ? Math.max(retries, 5) : retries;
+      // Only retry on 429 (rate limit) or 503 (temporarily unavailable)
+      const isRetryable = error.status === 429 || error.status === 503;
       
-      if (effectiveRetries > 0 && isRetryableError(error)) {
-        const actualDelay = (isHighDemand && retries > 1) ? Math.max(delay, 5000) : delay;
-        const nextDelay = (isHighDemand && retries > 1) ? actualDelay * 2 : actualDelay * 1.5;
-        
-        console.log(`Retryable error encountered (${isHighDemand ? 'High Demand' : 'General'}). Retrying in ${actualDelay}ms... (${effectiveRetries} retries left)`);
-        
-        await new Promise(resolve => setTimeout(resolve, actualDelay));
-        return withRetry(fn, effectiveRetries - 1, nextDelay);
+      if (retries > 0 && isRetryable) {
+        console.log(`Retryable error (${error.status}). Retrying in ${delay}ms... (${retries} left)`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return withRetry(fn, retries - 1, delay * 1.5);
       }
       throw error;
     }
@@ -650,159 +639,17 @@ export default function Dashboard() {
     }
   };
 
-  // Fetch profiles from Supabase on mount
-  const fetchProfiles = async () => {
-    try {
-      const { data, error } = await supabase
-        .from('user_profiles')
-        .select('*')
-        .order('created_at', { ascending: true });
-      if (error) throw error;
-      setProfiles(data || []);
-      return data || [];
-    } catch (err) {
-      console.error('Failed to fetch profiles:', err);
-      return [];
-    }
-  };
-
-  useEffect(() => {
-    // Check if we have a stored profile ID in localStorage (just the ID, not sensitive data)
-    const initProfiles = async () => {
-      const loadedProfiles = await fetchProfiles();
-      const storedProfileId = localStorage.getItem('active_profile_id');
-      
-      if (storedProfileId && loadedProfiles.length > 0) {
-        const found = loadedProfiles.find((p: UserProfile) => p.id === storedProfileId);
-        if (found) {
-          setActiveProfile(found);
-          if (found.gemini_api_key) {
-            setUserApiKey(found.gemini_api_key);
-            setHasKey(true);
-          } else {
-            // Profile exists but no API key — check server fallback
-            try {
-              const res = await fetch('/api/generate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: 'gemini-2.5-flash', contents: 'test', config: {} }),
-              });
-              setHasKey(res.status !== 401);
-            } catch {
-              setHasKey(false);
-            }
-          }
-          setIsCheckingKey(false);
-          return;
-        }
-      }
-      
-      // No stored profile — show profile selector
-      setShowProfileSelector(true);
-      setIsCheckingKey(false);
-    };
-    
-    initProfiles();
-  }, []);
-
-  const handleSelectProfile = async (profile: UserProfile) => {
-    setActiveProfile(profile);
-    localStorage.setItem('active_profile_id', profile.id);
-    setShowProfileSelector(false);
-    
-    if (profile.gemini_api_key) {
-      setUserApiKey(profile.gemini_api_key);
-      setHasKey(true);
-    } else {
-      // Check if server has a fallback key
-      try {
-        const res = await fetch('/api/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: 'gemini-2.5-flash', contents: 'test', config: {} }),
-        });
-        setHasKey(res.status !== 401);
-      } catch {
-        setHasKey(false);
-      }
-    }
-  };
-
-  const handleCreateProfile = async () => {
-    if (!newProfileName.trim()) return;
-    setIsCreatingProfile(true);
-    try {
-      const { data, error } = await supabase
-        .from('user_profiles')
-        .insert({ name: newProfileName.trim(), emoji: newProfileEmoji })
-        .select()
-        .single();
-      if (error) throw error;
-      setProfiles(prev => [...prev, data]);
-      setNewProfileName('');
-      setNewProfileEmoji('😊');
-      setShowNewProfileForm(false);
-      // Auto-select the new profile
-      handleSelectProfile(data);
-    } catch (err: any) {
-      console.error('Create profile error:', err);
-      setToastMessage('⚠️ ' + (err.message || 'Failed to create profile'));
-      setTimeout(() => setToastMessage(''), 4000);
-    } finally {
-      setIsCreatingProfile(false);
-    }
-  };
-
-  const handleSaveApiKey = async () => {
-    if (!apiKeyInput.trim() || !activeProfile) return;
-    setIsSavingApiKey(true);
-    try {
-      // Save to Supabase for cloud sync
-      const { error } = await supabase
-        .from('user_profiles')
-        .update({ gemini_api_key: apiKeyInput.trim() })
-        .eq('id', activeProfile.id);
-      if (error) throw error;
-      
-      setUserApiKey(apiKeyInput.trim());
-      setActiveProfile({ ...activeProfile, gemini_api_key: apiKeyInput.trim() });
-      setHasKey(true);
-      setToastMessage('✅ API key saved to cloud!');
-      setTimeout(() => setToastMessage(''), 3000);
-    } catch (err: any) {
-      console.error('Save API key error:', err);
-      setToastMessage('⚠️ Failed to save key: ' + (err.message || ''));
-      setTimeout(() => setToastMessage(''), 4000);
-    } finally {
-      setIsSavingApiKey(false);
-    }
-  };
-
-  const handleSwitchProfile = () => {
-    setShowProfileSelector(true);
-    setHasKey(false);
-    setUserApiKey('');
-    setActiveProfile(null);
-    localStorage.removeItem('active_profile_id');
-    fetchProfiles();
-  };
-
-  // Fetch all saved templates from Supabase (filtered by active profile)
+  // Fetch all saved templates from Supabase
   const fetchTemplates = async () => {
     setIsFetchingTemplates(true);
     try {
-      let query = supabase
+      const { data, error } = await supabase
         .from('campaign_settings')
         .select('*')
         .order('updated_at', { ascending: false });
-      
-      if (activeProfile) {
-        query = query.eq('user_profile_id', activeProfile.id);
+      if (!error && data) {
+        setSavedTemplates(data);
       }
-      
-      const { data, error } = await query;
-      if (error) throw error;
-      setSavedTemplates(data || []);
     } catch (error: any) {
       console.error('Fetch templates error:', error);
     } finally {
@@ -811,8 +658,28 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
-    if (hasKey && activeProfile) fetchTemplates();
-  }, [hasKey, activeProfile]);
+    const savedKey = localStorage.getItem('gemini_api_key');
+    if (savedKey) {
+      setUserApiKey(savedKey);
+      setApiKeyInput(savedKey);
+    }
+    fetchTemplates();
+  }, []);
+
+  const handleSaveApiKey = () => {
+    const key = apiKeyInput.trim();
+    setUserApiKey(key);
+    if (key) {
+      localStorage.setItem('gemini_api_key', key);
+      setToastMessage('✅ Custom Gemini API Key saved!');
+    } else {
+      localStorage.removeItem('gemini_api_key');
+      setToastMessage('ℹ️ Using server-side default API Key.');
+    }
+    setShowApiKeyModal(false);
+    setTimeout(() => setToastMessage(''), 3000);
+  };
+
 
   // Upload images helper
   const uploadProductImages = async (): Promise<string[]> => {
@@ -1195,17 +1062,25 @@ export default function Dashboard() {
     const errorStr = JSON.stringify(error).toLowerCase();
     const message = error.message?.toLowerCase() || '';
     
-    if (message.includes('requested entity was not found') || errorStr.includes('requested entity was not found')) {
+    if (message.includes('api key not valid') || errorStr.includes('api_key_invalid')) {
+      localStorage.removeItem('gemini_api_key');
+      setUserApiKey('');
+      setApiKeyInput('');
       setHasKey(false);
-      setToastMessage('API Key invalid or not found. Please update your API key in your profile settings.');
+      setToastMessage('API Key is invalid. Please paste a valid key below!');
+      setShowApiKeyModal(true);
+    } else if (message.includes('depleted') || errorStr.includes('depleted') || message.includes('prepayment')) {
+      setToastMessage('❌ Google API Error: Your prepayment credits are depleted. Please add credits at ai.studio/projects');
+    } else if (message.includes('requested entity was not found') || errorStr.includes('not_found')) {
+      setToastMessage('Model error: The selected AI model is currently unavailable or deprecated. Please try another model.');
     } else if (isRetryableError(error)) {
-      setToastMessage('High demand or quota exceeded. Please wait a moment and try again.');
+      setToastMessage('Temporary rate limit or high demand. Please wait a moment and try again.');
     } else {
       setToastMessage(error.message || defaultMessage);
     }
   };
 
-  const resizeImage = (base64Str: string, maxWidth = 1024, maxHeight = 1024): Promise<string> => {
+  const resizeImage = (base64Str: string, maxWidth = 512, maxHeight = 512): Promise<string> => {
     return new Promise((resolve) => {
       const img = new Image();
       img.src = base64Str;
@@ -1235,8 +1110,8 @@ export default function Dashboard() {
     });
   };
 
-  // Compress image to stay under maxSizeBytes (default 3MB) while maintaining quality
-  const compressImage = (base64Str: string, maxSizeBytes = 3 * 1024 * 1024): Promise<string> => {
+  // Compress image to stay under maxSizeBytes (default 500KB) while maintaining quality
+  const compressImage = (base64Str: string, maxSizeBytes = 512 * 1024): Promise<string> => {
     return new Promise((resolve) => {
       const img = new Image();
       img.src = base64Str;
@@ -1368,7 +1243,7 @@ export default function Dashboard() {
       
       contents.parts.push({ text: prompt });
 
-      const response = await withRetry(() => callAI('gemini-2.5-flash', contents, {
+      const response = await withRetry(() => callAI('gemini-flash-lite-latest', contents, {
           responseMimeType: "application/json",
           responseSchema: {
             type: SchemaType.OBJECT,
@@ -1461,7 +1336,7 @@ export default function Dashboard() {
       }
       contents.parts.push({ text: prompt });
 
-      const response = await withRetry(() => callAI('gemini-2.5-flash', contents, {
+      const response = await withRetry(() => callAI('gemini-flash-lite-latest', contents, {
           temperature: 1.3,
           responseMimeType: "application/json",
           responseSchema: {
@@ -1553,7 +1428,7 @@ export default function Dashboard() {
       }
       contents.parts.push({ text: prompt });
 
-      const response = await withRetry(() => callAI('gemini-2.5-pro', contents, {
+      const response = await withRetry(() => callAI('gemini-flash-lite-latest', contents, {
           temperature: 0.7,
           responseMimeType: "application/json",
           responseSchema: {
@@ -1953,7 +1828,7 @@ export default function Dashboard() {
       9. Write the content 100% natively in the Myanmar (Burmese) language. Warm sisterly tone. Never clinical or formal.`;
 
       const contents: any = { parts: [{ text: prompt }] };
-      const response = await withRetry(() => callAI('gemini-2.5-flash', contents, {
+      const response = await withRetry(() => callAI('gemini-flash-lite-latest', contents, {
           systemInstruction: MYANMAR_BEAUTY_HEALTH_WRITER_PROMPT,
           temperature: 1.4,
           topP: 0.95,
@@ -2158,27 +2033,32 @@ CURRENT DATE CONTEXT: ${currentMonth} ${currentYear}
       
       NARRATIVE ARC: ${selectedArc}
 
-      ${previousPlanSummary ? `\n=== CONTENT TO AVOID (previously generated — DO NOT repeat these topics or hooks) ===\n${previousPlanSummary}\n\nYou MUST create completely different topics, hooks, and angles from the above. Do NOT reuse any of these titles, hooks, or concepts even in rephrased form.\n` : ''}
+      ${previousPlanSummary ? `\n=== EXTREME AVOIDANCE RULES (DO NOT REPEAT) ===\n${previousPlanSummary}\n\nYou MUST NOT use any of these concepts again. Invent entirely new topics.\n` : ''}
+      
+      BEAUTY & SKINCARE VIRALITY RULES (CRITICAL):
+      - Maximize viral and trending tips, hacks, and tricks specific to the beauty/skincare/cosmetic field.
+      - Provide highly useful, actionable advice that audiences want to save and share instantly (e.g., secret techniques, layering hacks, dermatologist secrets).
+      - Frame products around solving extreme pain points or achieving trending "glass skin" / "clean girl" aesthetics.
+      
+      ANTI-REPETITION & MAXIMUM VARIANCE RULES (CRITICAL):
+      - This is Generation #${currentGenCount}. DO NOT use standard AI boilerplate templates.
+      - DO NOT give the same obvious content ideas (e.g., basic "how to use", basic "ingredients list", basic "before and after").
+      - INVENT highly specific, niche, and unexpected scenarios (e.g., "how to fix cakey makeup in 30 seconds", "the exact routine for 12-hour flights").
+      - Every single day MUST feel completely fresh, radically different from typical beauty ads, and highly unpredictable.
       
       ${isRegenerate ? `\nCRITICAL REGENERATION RULES:
-      - This is regeneration attempt #${currentGenCount}. The user was NOT satisfied with previous results.
-      - You MUST generate COMPLETELY DIFFERENT topics, hooks, and content concepts.
-      - Use DIFFERENT content angles, storytelling approaches, and creative hooks.
-      - Change the emotional trajectory and pacing of the campaign.
-      - Try unexpected, unconventional, or bold approaches that would surprise the user.
-      - DO NOT repeat any hook structure, topic, or phrasing from typical beauty/cosmetic campaigns.
-      - Think like a TOP-TIER creative director at a leading Myanmar agency in ${currentYear}.` : ''}
+      - The user was NOT satisfied with previous results. You MUST generate COMPLETELY DIFFERENT topics, hooks, and content concepts.
+      - Try unexpected, unconventional, or bold approaches that would surprise the user.` : ''}
       
       CRITICAL INSTRUCTIONS:
       1. Provide EXACTLY ${daysCount} items. Keep the summary short and punchy.
       2. The ENTIRE response (titles, summaries, hooks, everything) MUST be written perfectly in the Myanmar (Burmese) language.
-      3. TARGET AUDIENCE ALIGNMENT: You MUST strictly tailor all topics, hooks, and summaries to the specific Target Audience ("${targetAudience}"). Speak directly to their specific age group, pain points, desires, and lifestyle. Do not use generic messaging.
-      4. VARIETY IS CRITICAL: Each day MUST have a distinctly different topic, hook style, and emotional angle. No two days should feel similar in approach.
-      5. TREND AWARENESS: Reference current ${currentYear} trends, cultural moments, and social media formats where relevant.
-      6. Each hook should use a DIFFERENT hook technique (story, question, number, callout, POV, etc.)
-      7. RANDOM SEED: ${Math.random().toString(36).substring(2, 10)}-${Date.now() % 100000} (use this to ensure uniqueness)`;
+      3. TARGET AUDIENCE ALIGNMENT: You MUST strictly tailor all topics to "${targetAudience}".
+      4. VARIETY IS CRITICAL: Each day MUST have a distinctly different topic, hook style, and emotional angle.
+      5. TREND AWARENESS: Reference current ${currentYear} beauty trends and social media formats.
+      6. RANDOM SEED FOR MAXIMUM VARIANCE: ${Math.random().toString(36).substring(2, 12)}-${Date.now()} (Use this seed to radically change your output from any previous runs)`;
 
-      const response = await withRetry(() => callAI('gemini-2.5-flash', prompt, {
+      const response = await withRetry(() => callAI('gemini-flash-lite-latest', prompt, {
           systemInstruction: MYANMAR_STRATEGIST_PROMPT,
           temperature: 1.2 + (currentGenCount * 0.1 > 0.5 ? 0.5 : currentGenCount * 0.1),
           responseMimeType: "application/json",
@@ -2366,7 +2246,7 @@ CURRENT DATE CONTEXT: ${currentMonth} ${currentYear}
       }
       `;
 
-      const response = await withRetry(() => callAI('gemini-2.5-flash', prompt, {
+      const response = await withRetry(() => callAI('gemini-flash-lite-latest', prompt, {
           systemInstruction: MYANMAR_STRATEGIST_PROMPT,
           temperature: 1.0,
           maxOutputTokens: 8192,
@@ -2554,7 +2434,7 @@ CURRENT DATE CONTEXT: ${currentMonth} ${currentYear}
       }
       `;
 
-      const response = await withRetry(() => callAI('gemini-2.5-flash', prompt, {
+      const response = await withRetry(() => callAI('gemini-flash-lite-latest', prompt, {
           systemInstruction: MYANMAR_STRATEGIST_PROMPT,
           responseMimeType: "application/json",
           responseSchema: {
@@ -2720,7 +2600,7 @@ CURRENT DATE CONTEXT: ${currentMonth} ${currentYear}
       3. TARGET AUDIENCE ALIGNMENT: You MUST strictly tailor all hooks to the specific Target Audience ("${targetAudience}"). Speak directly to their specific age group, pain points, desires, and lifestyle. Do not use generic messaging.
       4. Return a JSON array of strings.`;
 
-      const response = await withRetry(() => callAI('gemini-2.5-flash', prompt, {
+      const response = await withRetry(() => callAI('gemini-flash-lite-latest', prompt, {
           systemInstruction: MYANMAR_STRATEGIST_PROMPT,
           responseMimeType: "application/json",
           responseSchema: {
@@ -2791,9 +2671,9 @@ CURRENT DATE CONTEXT: ${currentMonth} ${currentYear}
         if (prev >= 99) return 99;
         
         let increment = 0.1;
-        if (selectedImageModel === 'gemini-2.5-flash-image') {
+        if (selectedImageModel.includes('fast')) {
           increment = prev < 50 ? 0.8 : prev < 80 ? 0.4 : 0.2; // ~15s
-        } else if (selectedImageModel === 'gemini-2.5-flash-image-preview') {
+        } else if (selectedImageModel.includes('flash')) {
           increment = prev < 50 ? 0.4 : prev < 80 ? 0.2 : 0.1; // ~30s
         } else {
           increment = prev < 50 ? 0.2 : prev < 80 ? 0.1 : 0.05; // ~60s
@@ -3183,32 +3063,41 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
       }
       finalPromptText += `\n\nGeneration ID: ${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
-      const generateWithModel = async (modelName: string, config: any, retries = 2, usePlatformKey = false, customParts?: any[]) => {
+      const generateWithModel = async (modelName: string, config: any, retries = 2, overridePrompt?: string) => {
         if (isAbortedRef.current) throw new Error('ABORTED');
         console.log(`Generating with ${modelName}...`);
         setGenerationStep(`Generating with ${modelName.split('-')[1].toUpperCase()}...`);
 
-        return await withRetry(() => {
+        return await withRetry(async () => {
           if (isAbortedRef.current) throw new Error('ABORTED');
-          return callAI(modelName, {
-              parts: customParts || parts,
-            }, config, currentApiKey);
+          
+          const refImages = productImages.map(img => {
+            const match = img.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
+            return match ? { mimeType: match[1], data: match[2] } : null;
+          }).filter(Boolean);
+
+          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+          if (currentApiKey) headers['x-api-key'] = currentApiKey;
+
+          const res = await fetch('/api/generate-image', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              model: modelName,
+              prompt: overridePrompt || finalPromptText,
+              referenceImages: refImages,
+              config
+            })
+          });
+
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ error: 'Image generation failed' }));
+            throw new Error(err.error || `HTTP ${res.status}`);
+          }
+          
+          return res.json();
         }, retries);
       };
-
-      const parts: any[] = [];
-      if (productImages.length > 0) {
-        const match = productImages[0].match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
-        if (match) {
-          parts.push({
-            inlineData: {
-              mimeType: match[1],
-              data: match[2]
-            }
-          });
-        }
-      }
-      parts.push({ text: finalPromptText });
 
       let response;
       try {
@@ -3256,8 +3145,8 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
           // === AUTOMATIC FALLBACK TO ALTERNATIVE IMAGE MODELS ===
           const fallbackModels = [
             'gemini-2.5-flash-image',
-            'gemini-3.1-flash-image-preview',
             'imagen-4.0-fast-generate-001',
+            'imagen-4.0-generate-001',
           ].filter(m => m !== selectedImageModel); // Don't retry the same model
 
           console.warn(`Primary model ${selectedImageModel} is overloaded (503). Trying fallback models...`);
@@ -3304,8 +3193,6 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
             : 'premium skincare product';
           
           const genericPrompt = getPrompt(genericProductName);
-          const genericParts = [...parts];
-          genericParts[genericParts.length - 1] = { text: genericPrompt };
           
           try {
             const genericImageConfig: any = {
@@ -3321,7 +3208,7 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
             response = await generateWithModel(selectedImageModel, {
               responseModalities: ['Text', 'Image'],
               imageConfig: genericImageConfig,
-            }, 1, false, genericParts);
+            }, 1, genericPrompt);
           } catch (e) {
             console.error('Genericized prompt also failed:', e);
             throw primaryError; // Throw original error if generic also fails
@@ -3341,12 +3228,19 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
 
       let base64Image = null;
       let textResponse = '';
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          base64Image = `data:image/png;base64,${part.inlineData.data}`;
-          break;
-        } else if (part.text) {
-          textResponse += part.text;
+      if (response.image?.data) {
+        base64Image = `data:${response.image.mimeType || 'image/png'};base64,${response.image.data}`;
+      } else if (response.text) {
+        textResponse = response.text;
+      } else if (response.candidates?.[0]?.content?.parts) {
+        // Fallback for raw generateContent format just in case
+        for (const part of response.candidates[0].content.parts) {
+          if (part.inlineData) {
+            base64Image = `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
+            break;
+          } else if (part.text) {
+            textResponse += part.text;
+          }
         }
       }
 
@@ -3402,198 +3296,7 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
     setHistoryIndex(-1);
   };
 
-  if (isCheckingKey) {
-    return (
-      <main className="flex-1 w-full min-h-screen flex items-center justify-center bg-background transition-colors duration-300">
-        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-      </main>
-    );
-  }
 
-  // Profile selector screen
-  if (showProfileSelector) {
-    const emojiOptions = ['👑', '💖', '🌸', '✨', '🦋', '💎', '🌙', '🔥', '🎀', '🌺', '💫', '🍀', '🐱', '🌈', '😊', '🎯'];
-    return (
-      <main className="flex-1 w-full min-h-screen flex flex-col items-center justify-center p-4 relative bg-background transition-colors duration-300">
-        <SakuraFalling />
-        <div className="absolute top-4 right-4 z-10">
-          <ThemeToggle />
-        </div>
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
-          className="relative z-10 text-center max-w-lg w-full"
-        >
-          <h1 className="font-serif text-5xl md:text-6xl text-foreground mb-4 tracking-tighter">
-            Princess
-          </h1>
-          <p className="text-muted-foreground text-lg mb-12 font-light">Who&apos;s creating today?</p>
-
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 mb-8">
-            {profiles.map((profile, idx) => (
-              <motion.button
-                key={profile.id}
-                initial={{ opacity: 0, scale: 0.8 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: idx * 0.1, duration: 0.3 }}
-                onClick={() => handleSelectProfile(profile)}
-                className="glass border border-border rounded-2xl p-6 flex flex-col items-center gap-3 hover:border-primary/50 hover:shadow-lg hover:shadow-primary/10 transition-all duration-300 active:scale-95 group cursor-pointer"
-              >
-                <span className="text-4xl group-hover:scale-110 transition-transform duration-300">{profile.emoji}</span>
-                <span className="text-sm font-semibold text-foreground">{profile.name}</span>
-                {profile.gemini_api_key && (
-                  <span className="text-[10px] text-emerald-500 flex items-center gap-1">
-                    <Check className="w-3 h-3" /> API Key Set
-                  </span>
-                )}
-              </motion.button>
-            ))}
-
-            {/* Add New Profile Button */}
-            {!showNewProfileForm && (
-              <motion.button
-                initial={{ opacity: 0, scale: 0.8 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: profiles.length * 0.1, duration: 0.3 }}
-                onClick={() => setShowNewProfileForm(true)}
-                className="border-2 border-dashed border-border rounded-2xl p-6 flex flex-col items-center gap-3 hover:border-primary/50 transition-all duration-300 active:scale-95 cursor-pointer text-muted-foreground hover:text-foreground"
-              >
-                <Plus className="w-8 h-8" />
-                <span className="text-sm font-medium">New Profile</span>
-              </motion.button>
-            )}
-          </div>
-
-          {/* New Profile Form */}
-          <AnimatePresence>
-            {showNewProfileForm && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: 'auto' }}
-                exit={{ opacity: 0, height: 0 }}
-                className="glass border border-border rounded-2xl p-6 mb-6 overflow-hidden"
-              >
-                <h3 className="text-sm font-bold text-foreground mb-4">Create New Profile</h3>
-                
-                <div className="flex flex-wrap gap-2 mb-4 justify-center">
-                  {emojiOptions.map(e => (
-                    <button
-                      key={e}
-                      onClick={() => setNewProfileEmoji(e)}
-                      className={`w-10 h-10 rounded-xl flex items-center justify-center text-xl transition-all ${newProfileEmoji === e ? 'bg-primary/20 border-2 border-primary scale-110' : 'bg-background border border-border hover:bg-muted'}`}
-                    >
-                      {e}
-                    </button>
-                  ))}
-                </div>
-                
-                <input
-                  type="text"
-                  placeholder="Profile name..."
-                  value={newProfileName}
-                  onChange={(e) => setNewProfileName(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleCreateProfile()}
-                  className="w-full px-4 py-3 bg-background border border-border rounded-xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all text-center mb-4"
-                  autoFocus
-                />
-                
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => { setShowNewProfileForm(false); setNewProfileName(''); }}
-                    className="flex-1 py-3 bg-background border border-border rounded-xl text-sm font-medium text-muted-foreground hover:bg-muted transition-all"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={handleCreateProfile}
-                    disabled={!newProfileName.trim() || isCreatingProfile}
-                    className="flex-1 py-3 bg-primary text-primary-foreground rounded-xl text-sm font-bold hover:bg-primary/90 transition-all disabled:opacity-50 flex items-center justify-center gap-2"
-                  >
-                    {isCreatingProfile ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-                    Create
-                  </button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </motion.div>
-      </main>
-    );
-  }
-
-  // API key entry screen (shown after profile selected but no key set)
-  if (!hasKey && activeProfile) {
-    return (
-      <main className="flex-1 w-full min-h-screen flex flex-col items-center justify-center p-4 relative bg-background transition-colors duration-300">
-        <SakuraFalling />
-        <div className="absolute top-4 right-4 z-10 flex items-center gap-3">
-          <ThemeToggle />
-        </div>
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="glass border border-border rounded-3xl shadow-2xl p-12 max-w-md w-full text-center relative z-10 card-hover"
-        >
-          <button
-            onClick={handleSwitchProfile}
-            className="absolute top-4 left-4 p-2 rounded-xl hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
-            title="Switch Profile"
-          >
-            <ArrowLeft className="w-4 h-4" />
-          </button>
-
-          <div className="text-5xl mb-4">{activeProfile.emoji}</div>
-          <h1 className="font-serif text-3xl text-foreground mb-2 tracking-tight">
-            Hi, {activeProfile.name}!
-          </h1>
-          <p className="text-muted-foreground mb-8 text-base leading-relaxed">
-            Enter your Gemini API key to activate Princess.{' '}
-            <span className="text-xs opacity-70">Your key syncs across all devices.</span>
-          </p>
-          
-          <div className="space-y-4 mb-8">
-            <input
-              type="password"
-              placeholder="AIzaSy..."
-              value={apiKeyInput}
-              onChange={(e) => setApiKeyInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleSaveApiKey()}
-              className="w-full px-5 py-4 bg-background border border-border rounded-2xl text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all text-center"
-            />
-            <button
-              onClick={handleSaveApiKey}
-              disabled={!apiKeyInput.trim() || isSavingApiKey}
-              className="w-full py-4 bg-primary text-primary-foreground font-bold rounded-2xl hover:bg-primary/90 transition-all shadow-lg hover:shadow-xl active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-2"
-            >
-              {isSavingApiKey ? <Loader2 className="w-5 h-5 animate-spin" /> : <Wand2 className="w-5 h-5" />}
-              Activate AI Studio
-            </button>
-          </div>
-
-          <p className="text-xs text-muted-foreground">
-            Don&apos;t have a key? Get one for free at{' '}
-            <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="underline hover:text-primary transition-colors text-primary/80">
-              Google AI Studio
-            </a>
-          </p>
-        </motion.div>
-      </main>
-    );
-  }
-
-  // Fallback: no active profile and no profile selector
-  if (!hasKey) {
-    // Redirect to profile selector
-    if (!showProfileSelector) {
-      setShowProfileSelector(true);
-    }
-    return (
-      <main className="flex-1 w-full min-h-screen flex items-center justify-center bg-background transition-colors duration-300">
-        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-      </main>
-    );
-  }
 
   // ---------------------------------------------------------------------------
   // IMAGE GENERATOR VIEW (NEW PAGE)
@@ -3616,12 +3319,12 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
           </div>
           <div className="flex items-center gap-3">
             <button 
-              onClick={handleSwitchProfile}
-              className="h-9 px-3 rounded-full hover:bg-muted transition-colors text-muted-foreground hover:text-foreground border border-border bg-card shadow-sm flex items-center gap-2"
-              title={`Signed in as ${activeProfile?.name || 'Unknown'} — Click to switch`}
+              onClick={() => setShowApiKeyModal(true)}
+              className="h-9 px-3.5 rounded-full hover:bg-muted transition-colors text-muted-foreground hover:text-foreground border border-border bg-card shadow-sm flex items-center gap-2 text-xs font-semibold"
+              title="Configure Custom Gemini API Key"
             >
-              <span className="text-sm">{activeProfile?.emoji || '👤'}</span>
-              <span className="text-xs font-medium hidden sm:block">{activeProfile?.name || ''}</span>
+              <Key className="w-3.5 h-3.5 text-primary" />
+              <span>{userApiKey ? 'Custom Key Active' : 'API Key'}</span>
             </button>
             <ThemeToggle />
           </div>
@@ -3656,10 +3359,21 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                     </select>
                   </div>
                   
+                  <div className="mb-4">
+                    <textarea
+                      value={selectedHook}
+                      onChange={(e) => setSelectedHook(e.target.value)}
+                      placeholder="Type your custom hook text here or select an AI-generated one below..."
+                      className="w-full p-3 text-xs rounded-xl border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 resize-none"
+                      rows={3}
+                    />
+                  </div>
+
                   {generatedHooks.length > 0 ? (
-                    <div className="space-y-2 mb-4">
+                    <div className="space-y-2 mb-4 max-h-48 overflow-y-auto pr-1">
                       {generatedHooks.map((hook, idx) => (
                         <button 
+                          type="button"
                           key={idx}
                           onClick={() => setSelectedHook(hook)}
                           className={`w-full text-left p-3 text-xs rounded-xl border transition-all ${selectedHook === hook ? 'bg-primary/10 border-primary text-foreground shadow-sm' : 'bg-background/50 border-border/50 text-muted-foreground hover:border-border hover:bg-background'}`}
@@ -3675,6 +3389,7 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                   )}
                   
                   <button
+                    type="button"
                     onClick={handleGenerateHooks}
                     disabled={isGeneratingHooks}
                     className="w-full py-3 px-4 bg-background border border-border rounded-xl text-xs font-semibold text-foreground hover:bg-muted transition-all flex items-center justify-center gap-2 disabled:opacity-50 shadow-sm active:scale-[0.98]"
@@ -3936,7 +3651,7 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                       </p>
                     </div>
                   </div>
-                  <div className="relative inline-block w-12 h-6 transition duration-200 ease-in ml-4">
+                  <div className="relative inline-block w-14 h-7 transition duration-200 ease-in ml-4">
                     <input 
                       type="checkbox" 
                       name="toggle" 
@@ -3945,11 +3660,14 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                       readOnly
                       className="sr-only peer"
                     />
-                    <div className={`w-12 h-6 rounded-full transition-colors duration-300 ${
+                    <div className={`w-14 h-7 rounded-full flex items-center justify-between px-2 transition-colors duration-300 ${
                       includeModel ? 'bg-primary' : 'bg-muted-foreground/30'
-                    }`}></div>
-                    <div className={`absolute left-1 top-1 w-4 h-4 bg-white rounded-full transition-transform duration-300 shadow-sm ${
-                      includeModel ? 'translate-x-6' : 'translate-x-0'
+                    }`}>
+                      <span className={`text-[9px] font-bold ${includeModel ? 'text-primary-foreground opacity-100' : 'opacity-0'}`}>ON</span>
+                      <span className={`text-[9px] font-bold ${!includeModel ? 'text-muted-foreground opacity-100' : 'opacity-0'}`}>OFF</span>
+                    </div>
+                    <div className={`absolute left-1 top-1 w-5 h-5 bg-white rounded-full transition-transform duration-300 shadow-sm ${
+                      includeModel ? 'translate-x-7' : 'translate-x-0'
                     }`}></div>
                   </div>
                 </div>
@@ -3961,9 +3679,11 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                     onChange={(e) => setSelectedImageModel(e.target.value)}
                     className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all appearance-none cursor-pointer"
                   >
-                    <option value="gemini-3-pro-image-preview">Nano Banana Pro (Recommended)</option>
-                    <option value="gemini-2.5-flash-image-preview">Nano Banana 2 (Experimental)</option>
-                    <option value="gemini-2.5-flash-image">Nano Banana (Fastest)</option>
+                    <option value="gemini-3-pro-image-preview">🍌 Nano Banana Pro (Recommended Default)</option>
+                    <option value="gemini-2.5-flash-image">🆓 Gemini Image Gen (Fast)</option>
+                    <option value="imagen-4.0-fast-generate-001">💎 Imagen 4 Fast (Paid)</option>
+                    <option value="imagen-4.0-generate-001">💎 Imagen 4 Standard HD (Paid)</option>
+                    <option value="imagen-4.0-ultra-generate-001">💎 Imagen 4 Ultra (Paid, Best)</option>
                   </select>
                 </div>
 
@@ -4010,7 +3730,7 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                   </div>
                   <p className="text-xs text-neutral-400 font-mono">{Math.round(generationProgress)}%</p>
                   <p className="text-[10px] text-neutral-400 uppercase tracking-widest mt-2">
-                    Estimated time: {selectedImageModel === 'gemini-2.5-flash-image' ? '10-15s' : selectedImageModel === 'gemini-2.5-flash-image-preview' ? '20-30s' : '60-80s'}
+                    Estimated time: {selectedImageModel.includes('fast') ? '10-15s' : selectedImageModel.includes('flash') ? '25-40s' : '60-90s'}
                   </p>
                 </div>
               )}
@@ -4021,7 +3741,7 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                     src={finalImageWithLogo} 
                     alt="Generated visual" 
                     fill 
-                    className={`object-cover transition-opacity duration-500 ${isGeneratingImage ? 'opacity-40 grayscale-[0.5]' : 'opacity-100'}`} 
+                    className={`object-contain transition-opacity duration-500 ${isGeneratingImage ? 'opacity-40 grayscale-[0.5]' : 'opacity-100'}`} 
                     referrerPolicy="no-referrer"
                   />
                   
@@ -4041,7 +3761,7 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                         </div>
                         <p className="text-white/80 text-xs font-mono mb-2">{Math.round(generationProgress)}%</p>
                         <p className="text-white/60 text-[10px] uppercase tracking-widest">
-                          Estimated time: {selectedImageModel === 'gemini-2.5-flash-image' ? '10-15s' : selectedImageModel === 'gemini-2.5-flash-image-preview' ? '20-30s' : '60-80s'}
+                          Estimated time: {selectedImageModel.includes('fast') ? '10-15s' : selectedImageModel.includes('flash') ? '25-40s' : '60-90s'}
                         </p>
                       </div>
                       <button 
@@ -4089,12 +3809,12 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
         <SakuraFalling />
         <div className="absolute top-4 right-4 sm:top-8 sm:right-8 z-10 flex items-center gap-3">
           <button 
-            onClick={handleSwitchProfile}
-            className="h-9 px-3 rounded-full hover:bg-muted transition-colors text-muted-foreground hover:text-foreground border border-border bg-card shadow-sm flex items-center gap-2"
-            title={`Signed in as ${activeProfile?.name || 'Unknown'} — Click to switch`}
+            onClick={() => setShowApiKeyModal(true)}
+            className="h-9 px-3.5 rounded-full hover:bg-muted transition-colors text-muted-foreground hover:text-foreground border border-border bg-card shadow-sm flex items-center gap-2 text-xs font-semibold"
+            title="Configure Custom Gemini API Key"
           >
-            <span className="text-sm">{activeProfile?.emoji || '👤'}</span>
-            <span className="text-xs font-medium hidden sm:block">{activeProfile?.name || ''}</span>
+            <Key className="w-3.5 h-3.5 text-primary" />
+            <span>{userApiKey ? 'Custom Key Active' : 'API Key'}</span>
           </button>
           <ThemeToggle />
         </div>
@@ -4356,12 +4076,12 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
       
       <div className="absolute top-4 right-4 sm:top-8 sm:right-8 z-10 flex items-center gap-3">
         <button 
-          onClick={handleSwitchProfile}
-          className="h-9 px-3 rounded-full hover:bg-muted transition-colors text-muted-foreground hover:text-foreground border border-border bg-card shadow-sm flex items-center gap-2"
-          title={`Signed in as ${activeProfile?.name || 'Unknown'} — Click to switch`}
+          onClick={() => setShowApiKeyModal(true)}
+          className="h-9 px-3.5 rounded-full hover:bg-muted transition-colors text-muted-foreground hover:text-foreground border border-border bg-card shadow-sm flex items-center gap-2 text-xs font-semibold"
+          title="Configure Custom Gemini API Key"
         >
-          <span className="text-sm">{activeProfile?.emoji || '👤'}</span>
-          <span className="text-xs font-medium hidden sm:block">{activeProfile?.name || ''}</span>
+          <Key className="w-3.5 h-3.5 text-primary" />
+          <span>{userApiKey ? 'Custom Key Active' : 'API Key'}</span>
         </button>
         <ThemeToggle />
       </div>
@@ -4388,372 +4108,6 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
           transition={{ delay: 0.1 }}
           className="lg:col-span-4 space-y-8"
         >
-          {/* Save Template Modal */}
-          <AnimatePresence>
-            {showSaveModal && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-                onClick={() => { setShowSaveModal(false); setEditingTemplateId(null); }}
-              >
-                <motion.div
-                  initial={{ scale: 0.9, opacity: 0 }}
-                  animate={{ scale: 1, opacity: 1 }}
-                  exit={{ scale: 0.9, opacity: 0 }}
-                  onClick={(e) => e.stopPropagation()}
-                  className="glass border border-border rounded-3xl shadow-2xl p-8 w-full max-w-md mx-4"
-                >
-                  <h3 className="font-serif text-xl text-foreground mb-2 flex items-center gap-2">
-                    <Save className="w-5 h-5 text-primary" />
-                    {editingTemplateId ? 'Update Template' : 'Save as Template'}
-                  </h3>
-                  <p className="text-xs text-muted-foreground mb-6">
-                    {editingTemplateId ? 'Overwrite this template with current settings.' : 'Give your template a name to save it.'}
-                  </p>
-                  <input
-                    type="text"
-                    value={templateNameInput}
-                    onChange={(e) => setTemplateNameInput(e.target.value)}
-                    placeholder="e.g. Nu Skin Campaign, Skincare Promo..."
-                    className="w-full px-4 py-3.5 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 transition-all mb-6"
-                    autoFocus
-                    onKeyDown={(e) => { if (e.key === 'Enter') handleSaveSettings(); }}
-                  />
-                  <div className="flex gap-3">
-                    <button
-                      onClick={() => { setShowSaveModal(false); setEditingTemplateId(null); }}
-                      className="flex-1 py-3 px-4 bg-muted text-foreground rounded-2xl text-sm font-semibold hover:bg-muted/80 transition-all"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={() => handleSaveSettings()}
-                      disabled={!templateNameInput.trim() || isSavingSettings}
-                      className="flex-1 py-3 px-4 bg-gradient-to-r from-primary to-primary/80 text-primary-foreground rounded-2xl text-sm font-semibold hover:shadow-lg transition-all disabled:opacity-50 flex items-center justify-center gap-2"
-                    >
-                      {isSavingSettings ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                      {editingTemplateId ? 'Update' : 'Save'}
-                    </button>
-                  </div>
-                </motion.div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* Image Preview Modal */}
-          <AnimatePresence>
-            {showImagePreview && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md"
-                onClick={() => setShowImagePreview(null)}
-              >
-                <motion.div
-                  initial={{ scale: 0.8, opacity: 0 }}
-                  animate={{ scale: 1, opacity: 1 }}
-                  exit={{ scale: 0.8, opacity: 0 }}
-                  className="relative max-w-3xl max-h-[80vh] w-auto h-auto"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <NextImage
-                    src={showImagePreview}
-                    alt="Preview"
-                    width={800}
-                    height={800}
-                    className="rounded-2xl object-contain max-h-[80vh] w-auto shadow-2xl"
-                    referrerPolicy="no-referrer"
-                  />
-                  <button
-                    onClick={() => setShowImagePreview(null)}
-                    className="absolute -top-3 -right-3 p-2 bg-white dark:bg-neutral-800 rounded-full shadow-lg hover:scale-110 transition-transform"
-                  >
-                    <X className="w-5 h-5 text-foreground" />
-                  </button>
-                </motion.div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* Edit Data Modal */}
-          <AnimatePresence>
-            {showEditDataModal && editDataTemplate && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="fixed inset-0 z-50 flex items-start justify-center bg-black/60 backdrop-blur-sm overflow-y-auto py-8"
-                onClick={() => { setShowEditDataModal(false); setEditDataTemplate(null); }}
-              >
-                <motion.div
-                  initial={{ scale: 0.95, opacity: 0, y: 20 }}
-                  animate={{ scale: 1, opacity: 1, y: 0 }}
-                  exit={{ scale: 0.95, opacity: 0, y: 20 }}
-                  onClick={(e) => e.stopPropagation()}
-                  className="glass border border-border rounded-3xl shadow-2xl p-8 w-full max-w-2xl mx-4 my-auto"
-                >
-                  <div className="flex items-center justify-between mb-6">
-                    <h3 className="font-serif text-xl text-foreground flex items-center gap-2">
-                      <Database className="w-5 h-5 text-emerald-500" />
-                      Edit Template Data
-                    </h3>
-                    <button
-                      onClick={() => { setShowEditDataModal(false); setEditDataTemplate(null); }}
-                      className="p-2 text-muted-foreground hover:bg-muted rounded-xl transition-all"
-                    >
-                      <X className="w-5 h-5" />
-                    </button>
-                  </div>
-
-                  <div className="space-y-5 max-h-[65vh] overflow-y-auto pr-2 custom-scrollbar">
-                    {/* Template Name */}
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Template Name</label>
-                      <input
-                        type="text"
-                        value={editFormData.name}
-                        onChange={(e) => setEditFormData(prev => ({ ...prev, name: e.target.value }))}
-                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
-                      />
-                    </div>
-
-                    {/* Product Name */}
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Product Name</label>
-                      <input
-                        type="text"
-                        value={editFormData.product_name}
-                        onChange={(e) => setEditFormData(prev => ({ ...prev, product_name: e.target.value }))}
-                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
-                      />
-                    </div>
-
-                    {/* Product Images */}
-                    <div className="space-y-3">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">
-                        Product Images
-                      </label>
-
-                      {/* Existing images from Supabase */}
-                      {editFormData.product_image_urls.length > 0 && (
-                        <div>
-                          <p className="text-[9px] uppercase tracking-wider font-semibold text-muted-foreground/60 mb-2 ml-1">Saved Images</p>
-                          <div className="grid grid-cols-5 gap-2">
-                            {editFormData.product_image_urls.map((url, idx) => (
-                              <div key={`existing-${idx}`} className="relative aspect-square rounded-xl border border-border overflow-hidden group">
-                                <NextImage
-                                  src={url}
-                                  alt={`Product ${idx + 1}`}
-                                  fill
-                                  className="object-cover"
-                                  referrerPolicy="no-referrer"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={() => removeEditExistingImage(idx)}
-                                  className="absolute inset-0 bg-red-500/80 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                                >
-                                  <X className="w-5 h-5 text-white" />
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Newly added images (not yet uploaded) */}
-                      {editFormData.newImages.length > 0 && (
-                        <div>
-                          <p className="text-[9px] uppercase tracking-wider font-semibold text-emerald-500/80 mb-2 ml-1">New Images (will be uploaded on save)</p>
-                          <div className="grid grid-cols-5 gap-2">
-                            {editFormData.newImages.map((img, idx) => (
-                              <div key={`new-${idx}`} className="relative aspect-square rounded-xl border-2 border-emerald-500/30 overflow-hidden group">
-                                <NextImage
-                                  src={img}
-                                  alt={`New ${idx + 1}`}
-                                  fill
-                                  className="object-cover"
-                                  referrerPolicy="no-referrer"
-                                />
-                                <div className="absolute top-0.5 left-0.5 bg-emerald-500 text-white text-[7px] font-bold px-1 rounded-full">NEW</div>
-                                <button
-                                  type="button"
-                                  onClick={() => removeEditNewImage(idx)}
-                                  className="absolute inset-0 bg-red-500/80 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                                >
-                                  <X className="w-5 h-5 text-white" />
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Add images button */}
-                      <label className="cursor-pointer flex items-center gap-2 px-4 py-3 border-2 border-dashed border-border hover:border-primary/40 rounded-2xl hover:bg-muted/30 transition-all group">
-                        <input type="file" accept="image/*" multiple className="hidden" onChange={handleEditModalImageUpload} />
-                        <div className="w-8 h-8 rounded-full bg-muted flex items-center justify-center group-hover:bg-primary/10 transition-colors">
-                          <Plus className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
-                        </div>
-                        <div>
-                          <p className="text-xs font-semibold text-foreground group-hover:text-primary transition-colors">Add Product Images</p>
-                          <p className="text-[10px] text-muted-foreground">JPG, PNG, WEBP supported</p>
-                        </div>
-                      </label>
-                    </div>
-
-                    {/* Product Benefits */}
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Product Benefits</label>
-                      <input
-                        type="text"
-                        value={editFormData.product_benefits}
-                        onChange={(e) => setEditFormData(prev => ({ ...prev, product_benefits: e.target.value }))}
-                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
-                      />
-                    </div>
-
-                    {/* Emotional Response */}
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Emotional Response</label>
-                      <input
-                        type="text"
-                        value={editFormData.emotional_response}
-                        onChange={(e) => setEditFormData(prev => ({ ...prev, emotional_response: e.target.value }))}
-                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
-                      />
-                    </div>
-
-                    {/* Target Audience */}
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Target Audience</label>
-                      <textarea
-                        value={editFormData.target_audience}
-                        onChange={(e) => setEditFormData(prev => ({ ...prev, target_audience: e.target.value }))}
-                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm h-20 resize-none"
-                      />
-                    </div>
-
-                    {/* Campaign Goal */}
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Campaign Goal</label>
-                      <select
-                        value={editFormData.campaign_goal}
-                        onChange={(e) => setEditFormData(prev => ({ ...prev, campaign_goal: e.target.value }))}
-                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all appearance-none cursor-pointer text-sm"
-                      >
-                        <option value="Increase brand awareness">Increase brand awareness</option>
-                        <option value="Drive sales">Drive sales</option>
-                        <option value="Boost engagement">Boost engagement</option>
-                        <option value="Educate audience">Educate audience</option>
-                        <option value="Build community">Build community</option>
-                      </select>
-                    </div>
-
-                    {/* Framework */}
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Marketing Framework</label>
-                      <select
-                        value={editFormData.framework}
-                        onChange={(e) => setEditFormData(prev => ({ ...prev, framework: e.target.value }))}
-                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all appearance-none cursor-pointer text-sm"
-                      >
-                        <option value="AIDA (Attention, Interest, Desire, Action)">AIDA</option>
-                        <option value="PAS (Problem, Agitate, Solution)">PAS</option>
-                        <option value="StoryBrand (Character, Problem, Guide, Success)">StoryBrand</option>
-                        <option value="Hook, Story, Offer">Hook, Story, Offer</option>
-                        <option value="FAB (Features, Advantages, Benefits)">FAB</option>
-                        <option value="Educational & Debunking">Educational & Debunking</option>
-                        <option value="Transformation (Before/After)">Transformation (Before/After)</option>
-                        <option value="BAB (Before, After, Bridge)">BAB</option>
-                        <option value="4 C's (Clear, Concise, Compelling, Credible)">4 C&apos;s</option>
-                        <option value="QUEST (Qualify, Understand, Educate, Stimulate, Transition)">QUEST</option>
-                        <option value="PASTOR (Problem, Amplify, Story, Transformation, Offer, Response)">PASTOR</option>
-                      </select>
-                    </div>
-
-                    {/* Platform */}
-                    <div className="space-y-1.5">
-                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Platform</label>
-                      <select
-                        value={editFormData.platform}
-                        onChange={(e) => setEditFormData(prev => ({ ...prev, platform: e.target.value }))}
-                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all appearance-none cursor-pointer text-sm"
-                      >
-                        <option value="Instagram / TikTok (Visual-first)">Instagram / TikTok</option>
-                        <option value="LinkedIn (Professional)">LinkedIn</option>
-                        <option value="Twitter / X (Short-form)">Twitter / X</option>
-                        <option value="Facebook (Community-focused)">Facebook</option>
-                      </select>
-                    </div>
-
-
-                    {/* Days / Reels / Carousel counts */}
-                    <div className="grid grid-cols-3 gap-3">
-                      <div className="space-y-1.5">
-                        <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Days</label>
-                        <select
-                          value={editFormData.days_count}
-                          onChange={(e) => setEditFormData(prev => ({ ...prev, days_count: parseInt(e.target.value), reels_count: 0, carousel_count: 0 }))}
-                          className="w-full px-3 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
-                        >
-                          <option value={7}>7</option>
-                          <option value={10}>10</option>
-                          <option value={14}>14</option>
-                          <option value={21}>21</option>
-                          <option value={30}>30</option>
-                        </select>
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Reels</label>
-                        <input
-                          type="number"
-                          min="0"
-                          max={editFormData.days_count}
-                          value={editFormData.reels_count}
-                          onChange={(e) => setEditFormData(prev => ({ ...prev, reels_count: Math.min(prev.days_count - prev.carousel_count, Math.max(0, parseInt(e.target.value) || 0)) }))}
-                          className="w-full px-3 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
-                        />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Carousel</label>
-                        <input
-                          type="number"
-                          min="0"
-                          max={editFormData.days_count}
-                          value={editFormData.carousel_count}
-                          onChange={(e) => setEditFormData(prev => ({ ...prev, carousel_count: Math.min(prev.days_count - prev.reels_count, Math.max(0, parseInt(e.target.value) || 0)) }))}
-                          className="w-full px-3 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Footer with save/cancel */}
-                  <div className="flex gap-3 pt-6 mt-4 border-t border-border">
-                    <button
-                      onClick={() => { setShowEditDataModal(false); setEditDataTemplate(null); }}
-                      className="flex-1 py-3 px-4 bg-muted text-foreground rounded-2xl text-sm font-semibold hover:bg-muted/80 transition-all"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={handleSaveEditData}
-                      disabled={!editFormData.name.trim() || isSavingEditData}
-                      className="flex-1 py-3 px-4 bg-gradient-to-r from-emerald-500 to-emerald-600 text-white rounded-2xl text-sm font-semibold hover:shadow-lg hover:shadow-emerald-500/20 transition-all disabled:opacity-50 flex items-center justify-center gap-2"
-                    >
-                      {isSavingEditData ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                      Save Changes
-                    </button>
-                  </div>
-                </motion.div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
           {/* Saved Templates Gallery */}
           <div className="glass border border-border rounded-3xl shadow-2xl p-6 card-hover">
             <div className="flex items-center justify-between mb-5">
@@ -5462,6 +4816,433 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
           </div>
         </motion.div>
       </div>
+
+          {/* Gemini API Key Settings Modal */}
+          <AnimatePresence>
+            {showApiKeyModal && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+                onClick={() => setShowApiKeyModal(false)}
+              >
+                <motion.div
+                  initial={{ scale: 0.9, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 0.9, opacity: 0 }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="glass border border-border rounded-3xl shadow-2xl p-8 w-full max-w-md mx-4"
+                >
+                  <h3 className="font-serif text-xl text-foreground mb-2 flex items-center gap-2">
+                    <Key className="w-5 h-5 text-primary" />
+                    Gemini API Settings
+                  </h3>
+                  <p className="text-xs text-muted-foreground mb-6">
+                    Enter your custom Gemini API Key below to override the server key. Leave blank to use server defaults.
+                  </p>
+                  <input
+                    type="password"
+                    value={apiKeyInput}
+                    onChange={(e) => setApiKeyInput(e.target.value)}
+                    placeholder="AIzaSy... (or leave empty)"
+                    className="w-full px-4 py-3.5 bg-card border border-border rounded-2xl text-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary/30 transition-all mb-6 text-sm"
+                    autoFocus
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleSaveApiKey(); }}
+                  />
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => setShowApiKeyModal(false)}
+                      className="flex-1 py-3 px-4 bg-muted text-foreground rounded-2xl text-sm font-semibold hover:bg-muted/80 transition-all"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleSaveApiKey}
+                      className="flex-1 py-3 px-4 bg-gradient-to-r from-primary to-primary/80 text-primary-foreground rounded-2xl text-sm font-semibold hover:shadow-lg transition-all flex items-center justify-center gap-2"
+                    >
+                      <Save className="w-4 h-4" />
+                      Save Key
+                    </button>
+                  </div>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Save Template Modal */}
+          <AnimatePresence>
+            {showSaveModal && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+                onClick={() => { setShowSaveModal(false); setEditingTemplateId(null); }}
+              >
+                <motion.div
+                  initial={{ scale: 0.9, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 0.9, opacity: 0 }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="glass border border-border rounded-3xl shadow-2xl p-8 w-full max-w-md mx-4"
+                >
+                  <h3 className="font-serif text-xl text-foreground mb-2 flex items-center gap-2">
+                    <Save className="w-5 h-5 text-primary" />
+                    {editingTemplateId ? 'Update Template' : 'Save as Template'}
+                  </h3>
+                  <p className="text-xs text-muted-foreground mb-6">
+                    {editingTemplateId ? 'Overwrite this template with current settings.' : 'Give your template a name to save it.'}
+                  </p>
+                  <input
+                    type="text"
+                    value={templateNameInput}
+                    onChange={(e) => setTemplateNameInput(e.target.value)}
+                    placeholder="e.g. Nu Skin Campaign, Skincare Promo..."
+                    className="w-full px-4 py-3.5 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 transition-all mb-6"
+                    autoFocus
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleSaveSettings(); }}
+                  />
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => { setShowSaveModal(false); setEditingTemplateId(null); }}
+                      className="flex-1 py-3 px-4 bg-muted text-foreground rounded-2xl text-sm font-semibold hover:bg-muted/80 transition-all"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => handleSaveSettings()}
+                      disabled={!templateNameInput.trim() || isSavingSettings}
+                      className="flex-1 py-3 px-4 bg-gradient-to-r from-primary to-primary/80 text-primary-foreground rounded-2xl text-sm font-semibold hover:shadow-lg transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                    >
+                      {isSavingSettings ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                      {editingTemplateId ? 'Update' : 'Save'}
+                    </button>
+                  </div>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Image Preview Modal */}
+          <AnimatePresence>
+            {showImagePreview && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-md"
+                onClick={() => setShowImagePreview(null)}
+              >
+                <motion.div
+                  initial={{ scale: 0.8, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 0.8, opacity: 0 }}
+                  className="relative max-w-3xl max-h-[80vh] w-auto h-auto"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <NextImage
+                    src={showImagePreview}
+                    alt="Preview"
+                    width={800}
+                    height={800}
+                    className="rounded-2xl object-contain max-h-[80vh] w-auto shadow-2xl"
+                    referrerPolicy="no-referrer"
+                  />
+                  <button
+                    onClick={() => setShowImagePreview(null)}
+                    className="absolute -top-3 -right-3 p-2 bg-white dark:bg-neutral-800 rounded-full shadow-lg hover:scale-110 transition-transform"
+                  >
+                    <X className="w-5 h-5 text-foreground" />
+                  </button>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Edit Data Modal */}
+          <AnimatePresence>
+            {showEditDataModal && editDataTemplate && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="fixed inset-0 z-50 flex items-start justify-center bg-black/60 backdrop-blur-sm overflow-y-auto py-8"
+                onClick={() => { setShowEditDataModal(false); setEditDataTemplate(null); }}
+              >
+                <motion.div
+                  initial={{ scale: 0.95, opacity: 0, y: 20 }}
+                  animate={{ scale: 1, opacity: 1, y: 0 }}
+                  exit={{ scale: 0.95, opacity: 0, y: 20 }}
+                  onClick={(e) => e.stopPropagation()}
+                  className="glass border border-border rounded-3xl shadow-2xl p-8 w-full max-w-2xl mx-4 my-auto"
+                >
+                  <div className="flex items-center justify-between mb-6">
+                    <h3 className="font-serif text-xl text-foreground flex items-center gap-2">
+                      <Database className="w-5 h-5 text-emerald-500" />
+                      Edit Template Data
+                    </h3>
+                    <button
+                      onClick={() => { setShowEditDataModal(false); setEditDataTemplate(null); }}
+                      className="p-2 text-muted-foreground hover:bg-muted rounded-xl transition-all"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+
+                  <div className="space-y-5 max-h-[65vh] overflow-y-auto pr-2 custom-scrollbar">
+                    {/* Template Name */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Template Name</label>
+                      <input
+                        type="text"
+                        value={editFormData.name}
+                        onChange={(e) => setEditFormData(prev => ({ ...prev, name: e.target.value }))}
+                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                      />
+                    </div>
+
+                    {/* Product Name */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Product Name</label>
+                      <input
+                        type="text"
+                        value={editFormData.product_name}
+                        onChange={(e) => setEditFormData(prev => ({ ...prev, product_name: e.target.value }))}
+                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                      />
+                    </div>
+
+                    {/* Product Images */}
+                    <div className="space-y-3">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">
+                        Product Images
+                      </label>
+
+                      {/* Existing images from Supabase */}
+                      {editFormData.product_image_urls.length > 0 && (
+                        <div>
+                          <p className="text-[9px] uppercase tracking-wider font-semibold text-muted-foreground/60 mb-2 ml-1">Saved Images</p>
+                          <div className="grid grid-cols-5 gap-2">
+                            {editFormData.product_image_urls.map((url, idx) => (
+                              <div key={`existing-${idx}`} className="relative aspect-square rounded-xl border border-border overflow-hidden group">
+                                <NextImage
+                                  src={url}
+                                  alt={`Product ${idx + 1}`}
+                                  fill
+                                  className="object-cover"
+                                  referrerPolicy="no-referrer"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeEditExistingImage(idx)}
+                                  className="absolute inset-0 bg-red-500/80 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                                >
+                                  <X className="w-5 h-5 text-white" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Newly added images (not yet uploaded) */}
+                      {editFormData.newImages.length > 0 && (
+                        <div>
+                          <p className="text-[9px] uppercase tracking-wider font-semibold text-emerald-500/80 mb-2 ml-1">New Images (will be uploaded on save)</p>
+                          <div className="grid grid-cols-5 gap-2">
+                            {editFormData.newImages.map((img, idx) => (
+                              <div key={`new-${idx}`} className="relative aspect-square rounded-xl border-2 border-emerald-500/30 overflow-hidden group">
+                                <NextImage
+                                  src={img}
+                                  alt={`New ${idx + 1}`}
+                                  fill
+                                  className="object-cover"
+                                  referrerPolicy="no-referrer"
+                                />
+                                <div className="absolute top-0.5 left-0.5 bg-emerald-500 text-white text-[7px] font-bold px-1 rounded-full">NEW</div>
+                                <button
+                                  type="button"
+                                  onClick={() => removeEditNewImage(idx)}
+                                  className="absolute inset-0 bg-red-500/80 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                                >
+                                  <X className="w-5 h-5 text-white" />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Add images button */}
+                      <label className="cursor-pointer flex items-center gap-2 px-4 py-3 border-2 border-dashed border-border hover:border-primary/40 rounded-2xl hover:bg-muted/30 transition-all group">
+                        <input type="file" accept="image/*" multiple className="hidden" onChange={handleEditModalImageUpload} />
+                        <div className="w-8 h-8 rounded-full bg-muted flex items-center justify-center group-hover:bg-primary/10 transition-colors">
+                          <Plus className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
+                        </div>
+                        <div>
+                          <p className="text-xs font-semibold text-foreground group-hover:text-primary transition-colors">Add Product Images</p>
+                          <p className="text-[10px] text-muted-foreground">JPG, PNG, WEBP supported</p>
+                        </div>
+                      </label>
+                    </div>
+
+                    {/* Product Benefits */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Product Benefits</label>
+                      <input
+                        type="text"
+                        value={editFormData.product_benefits}
+                        onChange={(e) => setEditFormData(prev => ({ ...prev, product_benefits: e.target.value }))}
+                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                      />
+                    </div>
+
+                    {/* Emotional Response */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Emotional Response</label>
+                      <input
+                        type="text"
+                        value={editFormData.emotional_response}
+                        onChange={(e) => setEditFormData(prev => ({ ...prev, emotional_response: e.target.value }))}
+                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                      />
+                    </div>
+
+                    {/* Target Audience */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Target Audience</label>
+                      <textarea
+                        value={editFormData.target_audience}
+                        onChange={(e) => setEditFormData(prev => ({ ...prev, target_audience: e.target.value }))}
+                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm h-20 resize-none"
+                      />
+                    </div>
+
+                    {/* Campaign Goal */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Campaign Goal</label>
+                      <select
+                        value={editFormData.campaign_goal}
+                        onChange={(e) => setEditFormData(prev => ({ ...prev, campaign_goal: e.target.value }))}
+                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all appearance-none cursor-pointer text-sm"
+                      >
+                        <option value="Increase brand awareness">Increase brand awareness</option>
+                        <option value="Drive sales">Drive sales</option>
+                        <option value="Boost engagement">Boost engagement</option>
+                        <option value="Educate audience">Educate audience</option>
+                        <option value="Build community">Build community</option>
+                      </select>
+                    </div>
+
+                    {/* Framework */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Marketing Framework</label>
+                      <select
+                        value={editFormData.framework}
+                        onChange={(e) => setEditFormData(prev => ({ ...prev, framework: e.target.value }))}
+                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all appearance-none cursor-pointer text-sm"
+                      >
+                        <option value="AIDA (Attention, Interest, Desire, Action)">AIDA</option>
+                        <option value="PAS (Problem, Agitate, Solution)">PAS</option>
+                        <option value="StoryBrand (Character, Problem, Guide, Success)">StoryBrand</option>
+                        <option value="Hook, Story, Offer">Hook, Story, Offer</option>
+                        <option value="FAB (Features, Advantages, Benefits)">FAB</option>
+                        <option value="Educational & Debunking">Educational & Debunking</option>
+                        <option value="Transformation (Before/After)">Transformation (Before/After)</option>
+                        <option value="BAB (Before, After, Bridge)">BAB</option>
+                        <option value="4 C's (Clear, Concise, Compelling, Credible)">4 C&apos;s</option>
+                        <option value="QUEST (Qualify, Understand, Educate, Stimulate, Transition)">QUEST</option>
+                        <option value="PASTOR (Problem, Amplify, Story, Transformation, Offer, Response)">PASTOR</option>
+                      </select>
+                    </div>
+
+                    {/* Platform */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Platform</label>
+                      <select
+                        value={editFormData.platform}
+                        onChange={(e) => setEditFormData(prev => ({ ...prev, platform: e.target.value }))}
+                        className="w-full px-4 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all appearance-none cursor-pointer text-sm"
+                      >
+                        <option value="Instagram / TikTok (Visual-first)">Instagram / TikTok</option>
+                        <option value="LinkedIn (Professional)">LinkedIn</option>
+                        <option value="Twitter / X (Short-form)">Twitter / X</option>
+                        <option value="Facebook (Community-focused)">Facebook</option>
+                      </select>
+                    </div>
+
+
+                    {/* Days / Reels / Carousel counts */}
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="space-y-1.5">
+                        <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Days</label>
+                        <select
+                          value={editFormData.days_count}
+                          onChange={(e) => setEditFormData(prev => ({ ...prev, days_count: parseInt(e.target.value), reels_count: 0, carousel_count: 0 }))}
+                          className="w-full px-3 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                        >
+                          <option value={7}>7</option>
+                          <option value={10}>10</option>
+                          <option value={14}>14</option>
+                          <option value={21}>21</option>
+                          <option value={30}>30</option>
+                        </select>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Reels</label>
+                        <input
+                          type="number"
+                          min="0"
+                          max={editFormData.days_count}
+                          value={editFormData.reels_count}
+                          onChange={(e) => setEditFormData(prev => ({ ...prev, reels_count: Math.min(prev.days_count - prev.carousel_count, Math.max(0, parseInt(e.target.value) || 0)) }))}
+                          className="w-full px-3 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Carousel</label>
+                        <input
+                          type="number"
+                          min="0"
+                          max={editFormData.days_count}
+                          value={editFormData.carousel_count}
+                          onChange={(e) => setEditFormData(prev => ({ ...prev, carousel_count: Math.min(prev.days_count - prev.reels_count, Math.max(0, parseInt(e.target.value) || 0)) }))}
+                          className="w-full px-3 py-3 bg-card border border-border rounded-2xl text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all text-sm"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Footer with save/cancel */}
+                  <div className="flex gap-3 pt-6 mt-4 border-t border-border">
+                    <button
+                      onClick={() => { setShowEditDataModal(false); setEditDataTemplate(null); }}
+                      className="flex-1 py-3 px-4 bg-muted text-foreground rounded-2xl text-sm font-semibold hover:bg-muted/80 transition-all"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleSaveEditData}
+                      disabled={!editFormData.name.trim() || isSavingEditData}
+                      className="flex-1 py-3 px-4 bg-gradient-to-r from-emerald-500 to-emerald-600 text-white rounded-2xl text-sm font-semibold hover:shadow-lg hover:shadow-emerald-500/20 transition-all disabled:opacity-50 flex items-center justify-center gap-2"
+                    >
+                      {isSavingEditData ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                      Save Changes
+                    </button>
+                  </div>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+
     </main>
   );
 }
+
+
+
+
+
+
