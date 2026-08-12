@@ -12,19 +12,27 @@
   "dependencies": {
     "@google/genai": "^2.16.0",
     "@hookform/resolvers": "^5.2.1",
+    "@types/markdown-it": "^14.1.2",
+    "acorn": "^8.18.0",
     "autoprefixer": "^10.4.21",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "firebase": "^11.10.0",
+    "firebase-admin": "^14.2.0",
+    "firebase-functions": "^7.3.2",
+    "hono": "^4.13.1",
     "lucide-react": "^0.553.0",
+    "markdown-it": "^15.0.0",
     "motion": "^12.23.24",
     "next": "^15.4.9",
     "next-themes": "^0.4.6",
     "postcss": "^8.5.6",
+    "protobufjs": "^8.7.2",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
     "react-markdown": "^10.1.0",
-    "tailwind-merge": "^3.3.1"
+    "tailwind-merge": "^3.3.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.1.11",
