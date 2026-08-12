@@ -7,7 +7,9 @@ import { Sparkles, Calendar, Zap, Image as ImageIcon, Loader2, Download, ArrowLe
 import Markdown from 'react-markdown';
 import { ThemeToggle } from '@/components/theme-toggle';
 import { nuSkinProducts } from './nuskin-data';
-import { supabase } from '@/lib/supabaseClient';
+import { db, storage } from '@/lib/firebaseClient';
+import { collection, getDocs, doc, setDoc, addDoc, updateDoc, deleteDoc, query, orderBy } from 'firebase/firestore';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 
 // Schema type constants to replace the @google/genai Type enum
 // These string values are serialized to the API route which converts them back
@@ -423,6 +425,8 @@ export default function Dashboard() {
   // Campaign Settings State
   const [productName, setProductName] = useState('');
   const [productImages, setProductImages] = useState<string[]>([]);
+  const [studioReferenceImage, setStudioReferenceImage] = useState<string | null>(null);
+  const [includeLongText, setIncludeLongText] = useState<boolean>(true);
   const [productBenefits, setProductBenefits] = useState('');
   const [emotionalResponse, setEmotionalResponse] = useState('');
   const [targetAudience, setTargetAudience] = useState('Women aged 30-50, looking for effective beauty solutions');
@@ -639,17 +643,14 @@ export default function Dashboard() {
     }
   };
 
-  // Fetch all saved templates from Supabase
+  // Fetch all saved templates from Firebase
   const fetchTemplates = async () => {
     setIsFetchingTemplates(true);
     try {
-      const { data, error } = await supabase
-        .from('campaign_settings')
-        .select('*')
-        .order('updated_at', { ascending: false });
-      if (!error && data) {
-        setSavedTemplates(data);
-      }
+      const q = query(collection(db, 'campaign_settings'), orderBy('updated_at', 'desc'));
+      const snapshot = await getDocs(q);
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as SavedTemplate));
+      setSavedTemplates(data);
     } catch (error: any) {
       console.error('Fetch templates error:', error);
     } finally {
@@ -698,20 +699,18 @@ export default function Dashboard() {
         const ext = match[1].split('/')[1] || 'jpeg';
         const fileName = `campaign/product-${Date.now()}-${i}.${ext}`;
         
-        const { error: uploadError } = await supabase.storage
-          .from('product-images')
-          .upload(fileName, blob, { upsert: true, contentType: match[1] });
-        
-        if (uploadError) {
+        try {
+          const storageRef = ref(storage, 'template-images/' + fileName);
+          await uploadBytes(storageRef, blob, { contentType: match[1] });
+          const url = await getDownloadURL(storageRef);
+          imageUrls.push(url);
+        } catch (uploadError) {
           console.error('Upload error:', uploadError);
           continue;
         }
-        
-        const { data: urlData } = supabase.storage
-          .from('product-images')
-          .getPublicUrl(fileName);
-        
-        imageUrls.push(urlData.publicUrl);
+      } else if (base64.startsWith('http')) {
+        // It's already an uploaded Firebase URL, just keep it!
+        imageUrls.push(base64);
       }
     }
     return imageUrls;
@@ -753,17 +752,10 @@ export default function Dashboard() {
 
       if (editingTemplateId) {
         // Update existing template
-        const { error } = await supabase
-          .from('campaign_settings')
-          .update(payload)
-          .eq('id', editingTemplateId);
-        if (error) throw error;
+        await updateDoc(doc(db, 'campaign_settings', editingTemplateId), payload);
       } else {
         // Insert new
-        const { error } = await supabase
-          .from('campaign_settings')
-          .upsert(payload, { onConflict: 'name' });
-        if (error) throw error;
+        await addDoc(collection(db, 'campaign_settings'), payload);
       }
 
       setToastMessage(`✅ Template "${nameToUse}" saved!`);
@@ -798,24 +790,9 @@ export default function Dashboard() {
       if (template.carousel_count !== undefined) setCarouselCount(template.carousel_count);
       if (template.days_count !== undefined) setDaysCount(template.days_count);
 
-      // Download product images
+      // Set product images directly from URLs
       if (template.product_image_urls && template.product_image_urls.length > 0) {
-        const loadedImages: string[] = [];
-        for (const url of template.product_image_urls) {
-          try {
-            const response = await fetch(url);
-            const blob = await response.blob();
-            const base64 = await new Promise<string>((resolve) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve(reader.result as string);
-              reader.readAsDataURL(blob);
-            });
-            loadedImages.push(base64);
-          } catch (imgErr) {
-            console.error('Failed to load image:', url, imgErr);
-          }
-        }
-        setProductImages(loadedImages);
+        setProductImages([...template.product_image_urls]);
       } else {
         setProductImages([]);
       }
@@ -834,11 +811,7 @@ export default function Dashboard() {
   const handleDeleteTemplate = async (template: SavedTemplate) => {
     setIsDeletingTemplate(template.id);
     try {
-      const { error } = await supabase
-        .from('campaign_settings')
-        .delete()
-        .eq('id', template.id);
-      if (error) throw error;
+      await deleteDoc(doc(db, 'campaign_settings', template.id));
       setToastMessage(`🗑️ Template "${template.name}" deleted.`);
       await fetchTemplates();
     } catch (error: any) {
@@ -858,11 +831,7 @@ export default function Dashboard() {
       return;
     }
     try {
-      const { error } = await supabase
-        .from('campaign_settings')
-        .update({ name: newName, updated_at: new Date().toISOString() })
-        .eq('id', template.id);
-      if (error) throw error;
+      await updateDoc(doc(db, 'campaign_settings', template.id), { name: newName, updated_at: new Date().toISOString() });
       setToastMessage(`✅ Renamed to "${newName}".`);
       setRenamingTemplateId(null);
       setRenameInput('');
@@ -967,20 +936,15 @@ export default function Dashboard() {
           const ext = match[1].split('/')[1] || 'jpeg';
           const fileName = `campaign/product-${Date.now()}-${i}.${ext}`;
 
-          const { error: uploadError } = await supabase.storage
-            .from('product-images')
-            .upload(fileName, blob, { upsert: true, contentType: match[1] });
-
-          if (uploadError) {
+          try {
+            const storageRef = ref(storage, 'template-images/' + fileName);
+            await uploadBytes(storageRef, blob, { contentType: match[1] });
+            const url = await getDownloadURL(storageRef);
+            uploadedNewUrls.push(url);
+          } catch (uploadError) {
             console.error('Upload error:', uploadError);
             continue;
           }
-
-          const { data: urlData } = supabase.storage
-            .from('product-images')
-            .getPublicUrl(fileName);
-
-          uploadedNewUrls.push(urlData.publicUrl);
         }
       }
 
@@ -1006,11 +970,7 @@ export default function Dashboard() {
         updated_at: new Date().toISOString(),
       };
 
-      const { error } = await supabase
-        .from('campaign_settings')
-        .update(payload)
-        .eq('id', editDataTemplate.id);
-      if (error) throw error;
+      await updateDoc(doc(db, 'campaign_settings', editDataTemplate.id), payload);
 
       setToastMessage(`✅ Template "${editFormData.name}" updated!`);
       setShowEditDataModal(false);
@@ -2697,9 +2657,13 @@ CURRENT DATE CONTEXT: ${currentMonth} ${currentYear}
       const hookToUse = selectedHook || selectedDay.hook;
 
       const getPrompt = (pName: string) => {
-        const productIdentity = productImages.length > 0 
-          ? `CRITICAL REQUIREMENT: CLONE THE EXACT PRODUCT FROM THE PROVIDED REFERENCE IMAGE. Do NOT invent a product based on the name "${pName}". You MUST extract the product from the provided image and place it seamlessly into the new environment without changing its shape, branding, colors, or texture. The product name "${pName}" is ONLY for context, the visual appearance MUST come 100% from the uploaded image.`
-          : `Product: "${pName}".`;
+        const textControlPrompt = includeLongText 
+          ? '' 
+          : '\n\nCRITICAL TEXT REQUIREMENT: YOU MUST ONLY GENERATE THE HEADLINE TEXT. DO NOT INCLUDE ANY LONG TEXT, BODY PARAGRAPHS, DESCRIPTIONS, OR BULLET POINTS. Keep the text extremely minimal and punchy.';
+          
+        const productIdentity = studioReferenceImage 
+          ? `CRITICAL REQUIREMENT: CLONE THE EXACT PRODUCT FROM THE PROVIDED REFERENCE IMAGE. Do NOT invent a product based on the name "${pName}". You MUST extract the product from the provided image and place it seamlessly into the new environment without changing its shape, branding, colors, or texture. The product name "${pName}" is ONLY for context, the visual appearance MUST come 100% from the uploaded reference image.`
+          : (productImages.length > 0 ? `CRITICAL REQUIREMENT: CLONE THE EXACT PRODUCT FROM THE PROVIDED REFERENCE IMAGE. Do NOT invent a product based on the name "${pName}". You MUST extract the product from the provided image and place it seamlessly into the new environment without changing its shape, branding, colors, or texture. The product name "${pName}" is ONLY for context, the visual appearance MUST come 100% from the uploaded image.` : `Product: "${pName}".`);
 
         if (imageStyle === 'Auto (AI Recommended)') {
           // === AI ART DIRECTOR v2: DEEP CONTENT-AWARE VISUAL ENGINE ===
@@ -2973,10 +2937,11 @@ ${productContext ? `CRITICAL PRODUCT RULES:\n${productContext}` : ''}
 - The text should enhance the image, not compete with it
 - For Facebook: text must be readable even at mobile feed sizes
 - Suitable for ${platformTarget} marketing
+- ${includeLongText ? 'Include supporting body text if appropriate.' : 'ONLY INCLUDE THE HEADLINE TEXT. DO NOT INCLUDE ANY LONG TEXT, BODY PARAGRAPHS, OR BULLET POINTS.'}
 
-CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand logos, company names, or trademarks (such as "Nu Skin") on the image or product. You must generate the headline text, but ZERO logos.`;
+CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand logos, company names, or trademarks (such as "Nu Skin") on the image or product. You must generate the headline text, but ZERO logos.${textControlPrompt}`;
         } else if (imageStyle === 'DGSA 1') {
-          return `A professional, 8K Quality high-resolution photo of (a breathtakingly beautiful, highly attractive young Korean or Chinese Female) talent, expertly posed and holding ${pName}. The talent MUST have very light, glowing skin color and 100% life-like realistic skin texture with visible pores. DO NOT make the skin look like plastic or CGI. ${pName} is prominently featured in the foreground, sharp and in focus, with the talent subtly positioned to draw attention to it. The talent's confident expression complements the product's presence. The image is captured in a modern studio, luxurious interior, urban setting with soft, natural light, with a color palette cohesive with ${pName}'s branding. The composition is dynamic and clean, with the primary focus clearly on the product, supported by the talent's pose and gaze. Please do not change product photo. Do not change product's image and not too big in hand of lady. The lady have beautiful smile and teeth showing.\n\n${productIdentity}\nHeadline/Hook Text to Overlay: "${hookToUse}".\nText Overlay Style: "${textOverlayStyle}".\nCRITICAL: Include high-quality typography and Text Overlay in perfectly accurate Myanmar (Burmese) language related to the concept. CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand logos, company names, or trademarks (such as "Nu Skin") on the image or product. You must generate the headline text, but ZERO logos.`;
+          return `A professional, 8K Quality high-resolution photo of (a breathtakingly beautiful, highly attractive young Korean or Chinese Female) talent, expertly posed and holding ${pName}. The talent MUST have very light, glowing skin color and 100% life-like realistic skin texture with visible pores. DO NOT make the skin look like plastic or CGI. ${pName} is prominently featured in the foreground, sharp and in focus, with the talent subtly positioned to draw attention to it. The talent's confident expression complements the product's presence. The image is captured in a modern studio, luxurious interior, urban setting with soft, natural light, with a color palette cohesive with ${pName}'s branding. The composition is dynamic and clean, with the primary focus clearly on the product, supported by the talent's pose and gaze. Please do not change product photo. Do not change product's image and not too big in hand of lady. The lady have beautiful smile and teeth showing.\n\n${productIdentity}\nHeadline/Hook Text to Overlay: "${hookToUse}".\nText Overlay Style: "${textOverlayStyle}".\nCRITICAL: Include high-quality typography and Text Overlay in perfectly accurate Myanmar (Burmese) language related to the concept. CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand logos, company names, or trademarks (such as "Nu Skin") on the image or product. You must generate the headline text, but ZERO logos.${textControlPrompt}`;
         } else if (imageStyle === 'DGSA 2') {
           return `A professional, 8K Quality high-resolution photo of (a breathtakingly handsome, highly attractive young Korean or Chinese Male) talent, expertly posed and holding ${pName}. The talent MUST have very light, glowing skin color and 100% life-like realistic skin texture with visible pores. DO NOT make the skin look like plastic or CGI. ${pName} is prominently featured in the foreground, sharp and in focus, with the talent subtly positioned to draw attention to it. The talent's confident expression complements the product's presence. The image is captured in a modern studio, luxurious interior, urban setting with soft, natural light, with a color palette cohesive with ${pName}'s branding. The composition is dynamic and clean, with the primary focus clearly on the product, supported by the talent's pose and gaze. Please do not change product photo. Do not change product's image and not too big in hand of man. The man have beautiful smile and teeth showing.\n\n${productIdentity}\nHeadline/Hook Text to Overlay: "${hookToUse}".\nText Overlay Style: "${textOverlayStyle}".\nCRITICAL: Include high-quality typography and Text Overlay in perfectly accurate Myanmar (Burmese) language related to the concept. CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand logos, company names, or trademarks (such as "Nu Skin") on the image or product. You must generate the headline text, but ZERO logos.`;
         } else if (imageStyle === 'DGSA 3') {
@@ -3071,7 +3036,8 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
         return await withRetry(async () => {
           if (isAbortedRef.current) throw new Error('ABORTED');
           
-          const refImages = productImages.map(img => {
+          const imagesToUse = studioReferenceImage ? [studioReferenceImage] : productImages;
+          const refImages = imagesToUse.map(img => {
             const match = img.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
             return match ? { mimeType: match[1], data: match[2] } : null;
           }).filter(Boolean);
@@ -3466,6 +3432,60 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                       <option value="16:9">16:9 Landscape</option>
                     </select>
                   </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Include Long Text</label>
+                    <div className="flex items-center bg-card border border-border rounded-2xl px-4 py-3.5 h-[50px]">
+                      <span className="text-sm flex-1 text-foreground">Add text overlays</span>
+                      <button
+                        onClick={() => setIncludeLongText(!includeLongText)}
+                        className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${includeLongText ? 'bg-primary' : 'bg-neutral-600'}`}
+                      >
+                        <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${includeLongText ? 'translate-x-4' : 'translate-x-0'}`} />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Reference Image</label>
+                    <div className="relative flex items-center bg-card border border-border rounded-2xl px-4 py-2 h-[50px]">
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                        title="Upload reference image"
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            const reader = new FileReader();
+                            reader.onloadend = () => setStudioReferenceImage(reader.result as string);
+                            reader.readAsDataURL(file);
+                          }
+                        }}
+                      />
+                      <div className="flex items-center gap-2 w-full overflow-hidden relative z-0">
+                        {studioReferenceImage ? (
+                          <>
+                            <div className="w-6 h-6 rounded overflow-hidden flex-shrink-0 relative bg-neutral-800">
+                               <NextImage src={studioReferenceImage} alt="ref" fill className="object-cover" />
+                            </div>
+                            <span className="text-xs text-foreground truncate">Image loaded</span>
+                            <button 
+                              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setStudioReferenceImage(null); }}
+                              className="ml-auto text-neutral-400 hover:text-red-400 z-20 p-1 relative"
+                            >
+                              ×
+                            </button>
+                          </>
+                        ) : (
+                          <span className="text-sm text-muted-foreground truncate">Upload reference...</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
                 
                 <div className="space-y-2">
                   <label className="block text-[10px] uppercase tracking-[0.2em] font-bold text-muted-foreground ml-1">Image Style</label>
@@ -3708,7 +3728,6 @@ CRITICAL NEGATIVE PROMPT FOR LOGOS: DO NOT draw, generate, or include ANY brand 
                   )}
                 </div>
               </div>
-            </div>
           </motion.div>
 
           {/* Right Column: Result */}

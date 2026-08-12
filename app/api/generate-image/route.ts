@@ -148,7 +148,9 @@ export async function POST(request: NextRequest) {
         }
       }
 
-      const aspectRatioString = config?.aspectRatio ? `\n\n[CRITICAL REQUIREMENT: You MUST generate this image in exactly ${config.aspectRatio} aspect ratio. Do not use 1:1 if a different ratio is requested.]` : '';
+      const aspectRatioString = config?.aspectRatio 
+        ? `\n\n[CRITICAL REQUIREMENT: You MUST generate this image in exactly ${config.aspectRatio} aspect ratio. Ensure the image dimensions perfectly match this ratio.]` 
+        : '';
       parts.push({ text: prompt + aspectRatioString });
 
       const response = await ai.models.generateContent({
